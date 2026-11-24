@@ -27,7 +27,7 @@ import unicodedata
 # =========================
 
 
-
+ABA_MODELO = "MODELO"
 @st.cache_resource
 def garantir_playwright_chromium():
     cache_dir = os.path.expanduser("~/.cache/ms-playwright")
