@@ -21,6 +21,7 @@ import requests
 import streamlit as st
 
 import extracao_original as original
+from corrigir_links_ods import corrigir_links_aba
 
 st.set_page_config(page_title="Extração real para ODS - ALMG", layout="wide")
 st.title("Extração do Executivo e Legislativo → ODS no WebDrive")
@@ -258,6 +259,7 @@ if st.button('1. Extrair diários reais e preparar ODS', type='primary'):
         payload = criar_payload(jornal, urls, dfs)
         with st.spinner('Duplicando MODELO e preenchendo o ODS real...'):
             saida = preencher_com_libreoffice(origem, payload)
+            saida = corrigir_links_aba(saida, aba, urls)
         abas_depois = nomes_abas(saida)
         if len(abas_depois) != len(abas_anteriores)+1 or abas_depois[1] != aba or set(abas_depois) != set(abas_anteriores) | {aba}:
             raise RuntimeError('Validação do ODS falhou: abas originais não foram preservadas corretamente.')
