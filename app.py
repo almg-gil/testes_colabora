@@ -1,0 +1,315 @@
+# -*- coding: utf-8 -*-
+"""Teste end-to-end: diários REAIS -> DataFrames -> ODS real -> WebDrive.
+Não utiliza dados fictícios. Não muda arquivo remoto sem confirmação.
+"""
+import hashlib
+import zipfile as zipfile_archive
+import hmac
+import io
+import json
+import re
+import subprocess
+import tempfile
+import zipfile
+from datetime import date
+from pathlib import Path
+from urllib.parse import quote, urlsplit
+from xml.etree import ElementTree as ET
+
+import pandas as pd
+import requests
+import streamlit as st
+
+import extracao_original as original
+
+st.set_page_config(page_title="Extração real para ODS - ALMG", layout="wide")
+st.title("Extração de Diários Oficiais → ODS no WebDrive")
+st.caption("Teste com dados reais, restrito à cópia GDI-GIL/Testes/Controle de Atividades 2026.ods")
+
+HOST = 'webdrive.almg.gov.br'
+PASTA_PERMITIDA = 'GDI-GIL/Testes'
+ARQUIVO_PERMITIDO = 'Controle de Atividades 2026.ods'
+MIME_ODS = 'application/vnd.oasis.opendocument.spreadsheet'
+MAX_ODS = 30 * 1024 * 1024
+
+
+def segredo(nome):
+    valor = str(st.secrets.get(nome, '')).strip()
+    if not valor:
+        raise ValueError('Configure o Secret ' + nome)
+    return valor
+
+
+def endereco_ods():
+    base = str(st.secrets.get('WEB_DAV_BASE', 'https://webdrive.almg.gov.br/remote.php/webdav')).rstrip('/')
+    usuario = segredo('WEB_DAV_USUARIO')
+    pasta = str(st.secrets.get('WEB_DAV_PASTA', PASTA_PERMITIDA)).strip('/')
+    arquivo = str(st.secrets.get('WEB_DAV_ARQUIVO', ARQUIVO_PERMITIDO))
+    partes = urlsplit(base)
+    if partes.scheme != 'https' or partes.hostname != HOST or partes.port not in (None, 443):
+        raise ValueError('O WebDAV deve estar hospedado em https://webdrive.almg.gov.br')
+    if re.search(r'[^a-zA-Z0-9_\-./]', pasta) or pasta != PASTA_PERMITIDA or arquivo != ARQUIVO_PERMITIDO:
+        raise ValueError('Por segurança, este aplicativo somente altera a cópia GDI-GIL/Testes/Controle de Atividades 2026.ods')
+    if not re.fullmatch(r'm\d{5,6}', usuario, re.I):
+        raise ValueError('WEB_DAV_USUARIO deve conter a matrícula (m + cinco ou seis dígitos).')
+    if partes.path == '/remote.php/webdav':
+        prefixo = base
+    elif partes.path == '/remote.php/dav/files':
+        prefixo = base + '/' + quote(usuario, safe='')
+    else:
+        raise ValueError('WEB_DAV_BASE deve terminar em /remote.php/webdav ou /remote.php/dav/files')
+    relativo = '/'.join(quote(item, safe='') for item in (pasta + '/' + arquivo).split('/'))
+    return prefixo + '/' + relativo
+
+
+def sessao():
+    s = requests.Session()
+    s.auth = (segredo('WEB_DAV_USUARIO'), segredo('WEB_DAV_SENHA_APP'))
+    s.headers['User-Agent'] = 'ALMG-ODS-WebDAV-Teste-Real/1.0'
+    return s
+
+
+def baixar_ods():
+    url = endereco_ods()
+    s = sessao()
+    with s.get(url, stream=True, timeout=(15, 120), allow_redirects=False) as resposta:
+        if resposta.status_code != 200:
+            raise RuntimeError('Leitura WebDAV: HTTP ' + str(resposta.status_code))
+        etag = resposta.headers.get('ETag')
+        if not etag:
+            raise RuntimeError('Servidor não retornou ETag; gravação bloqueada por segurança.')
+        buf = io.BytesIO()
+        for parte in resposta.iter_content(262144):
+            if parte:
+                if buf.tell() + len(parte) > MAX_ODS:
+                    raise RuntimeError('ODS maior que 30 MB. Ajuste o limite após análise.')
+                buf.write(parte)
+    conteudo = buf.getvalue()
+    abas = nomes_abas(conteudo)
+    if 'MODELO' not in abas:
+        raise RuntimeError('Aba MODELO ausente no arquivo remoto.')
+    return conteudo, etag, abas
+
+
+def nomes_abas(conteudo):
+    if not zipfile.is_zipfile(io.BytesIO(conteudo)):
+        raise RuntimeError('O servidor não retornou um arquivo ODS válido.')
+    with zipfile.ZipFile(io.BytesIO(conteudo)) as z:
+        if z.read('mimetype').decode('ascii', errors='replace').strip() != MIME_ODS:
+            raise RuntimeError('O arquivo remoto não é uma planilha ODS.')
+        ns = '{urn:oasis:names:tc:opendocument:xmlns:table:1.0}'
+        with z.open('content.xml') as xml:
+            return [el.attrib.get(ns+'name', '') for _, el in ET.iterparse(xml, events=('start',)) if el.tag == ns+'table']
+
+
+def gravar_ods(conteudo, etag):
+    resposta = sessao().put(endereco_ods(), data=conteudo,
+        headers={'If-Match': etag, 'Content-Type': MIME_ODS},
+        timeout=(15, 180), allow_redirects=False)
+    if resposta.status_code in (409, 412, 423):
+        raise RuntimeError('A planilha foi modificada/bloqueada no WebDrive (HTTP %s). Nada foi sobrescrito: faça nova extração.' % resposta.status_code)
+    if resposta.status_code not in (200, 201, 204):
+        raise RuntimeError('Gravação não confirmada: HTTP ' + str(resposta.status_code))
+    return resposta.status_code
+
+
+def converter_valor(valor):
+    """Converte as fórmulas HIPERLINK geradas no código original para UNO."""
+    if isinstance(valor, str) and valor.startswith('=HIPERLINK('):
+        m = re.fullmatch(r'=HIPERLINK\("((?:[^"]|"")*)";"((?:[^"]|"")*)"\)', valor)
+        if m:
+            return {'url': m.group(1).replace('""','"'), 'texto': m.group(2).replace('""','"')}
+    if pd.isna(valor) if not isinstance(valor, (list, dict)) else False:
+        return ''
+    return valor
+
+
+def converter_linhas(linhas):
+    return [[converter_valor(v) for v in linha] for linha in linhas]
+
+
+def linhas_reais(data_str, urls, dfs):
+    a, b, c, d, e, f = dfs
+    return {
+        'executivo': converter_linhas(original.montar_linhas_normas(data_str, a, urls['executivo_html'])),
+        'administrativo': converter_linhas(original.montar_linhas_normas(data_str, b, urls['administrativo'], True)),
+        'legislativo': converter_linhas(original.montar_linhas_normas(data_str, c, urls['legislativo'], True)),
+        'proposicoes': converter_linhas(original.montar_linhas_proposicoes(data_str, d, urls['legislativo'], True)),
+        'requerimentos': converter_linhas(original.montar_linhas_requerimentos(data_str, e, urls['legislativo'], True)),
+        'pareceres': converter_linhas(original.montar_linhas_pareceres(data_str, f, urls['legislativo'], True)),
+        'justica': converter_linhas(original.montar_linhas_normas(data_str, pd.DataFrame(), '')),
+    }
+
+
+def criar_payload(data_jornal, urls, dfs):
+    a,b,c,d,e,f = dfs
+    qtd_alt = [original.somar_quantidade_vides(x) for x in (a,b,c)]
+    return {
+        'modelo': 'MODELO',
+        'aba': data_jornal.strftime('%d%m'),
+        'secoes': linhas_reais(data_jornal.strftime('%d/%m/%Y'), urls, dfs),
+        'totais': {
+            'normas': sum(original.contar_normas_principais(x) for x in (a,b,c)),
+            'alteracoes': sum(x[0] for x in qtd_alt),
+            'vides': sum(x[1] for x in qtd_alt),
+            'proposicoes': len(d), 'requerimentos': len(e),
+            'pareceres': len(f), 'justica': 0,
+        }
+    }
+
+
+def preencher_com_libreoffice(ods_origem, payload):
+    with tempfile.TemporaryDirectory(prefix='almg_ods_') as temp:
+        pasta = Path(temp)
+        origem, destino, dados = (pasta/'origem.ods', pasta/'saida.ods', pasta/'payload.json')
+        origem.write_bytes(ods_origem)
+        dados.write_text(json.dumps(payload, ensure_ascii=False, default=str), encoding='utf-8')
+        r = subprocess.run(['/usr/bin/python3', str(Path(__file__).with_name('ods_worker.py')),
+                            str(origem), str(destino), str(dados)], capture_output=True,
+                            text=True, timeout=240)
+        if r.returncode or not destino.exists():
+            raise RuntimeError('Falha na edição do ODS. ' + (r.stdout+' '+r.stderr)[-1600:])
+        return destino.read_bytes()
+
+
+def extrair_data_real(data_jornal, data_trabalho):
+    texto_data = data_jornal.strftime('%d/%m/%Y')
+    urls = original.montar_urls(original.preparar_datas(texto_data))
+    erros = {}
+    resultados = {}
+    dfs = [pd.DataFrame() for _ in range(6)]
+    # Igual ao aplicativo original: Diário do Executivo via Playwright e API.
+    try:
+        original.garantir_playwright_chromium()
+        pdf = original.baixar_pdf_jornal_mg_por_link(urls['executivo_html'])
+        df = original.ExecutiveProcessor(pdf).process_pdf()
+        if df is None: df = pd.DataFrame()
+        if not df.empty:
+            df = df.copy()
+            df['Ano'] = df['Sanção'].fillna('').astype(str).str[-4:] if 'Sanção' in df.columns else ''
+        dfs[0] = df
+        resultados['Executivo'] = 'OK — %d registros' % len(df)
+    except Exception as e:
+        erros['Executivo'] = '%s: %s' % (type(e).__name__, e)
+    try:
+        pdf = original.baixar(urls['legislativo'])
+        dados = original.LegislativeProcessor(pdf).process_all()
+        dfs[2] = dados['Normas'].rename(columns={'Sigla':'Tipo'}).copy()
+        dfs[3] = dados['Proposicoes'].rename(columns={'Sigla':'Tipo', 'Categoria':'Observação'}).copy()
+        dfs[4] = dados['Requerimentos'].rename(columns={'Sigla':'Tipo', 'Classificação':'Observação'}).copy()
+        dfs[5] = dados['Pareceres'].rename(columns={'Sigla':'Tipo', 'Tipo':'Subtipo'}).copy()
+        resultados['Legislativo'] = 'OK — %d normas, %d proposições, %d requerimentos, %d pareceres' % tuple(len(dfs[i]) for i in (2,3,4,5))
+    except Exception as e:
+        erros['Legislativo'] = '%s: %s' % (type(e).__name__, e)
+    try:
+        pdf, metadados = original.baixar_pdf_administrativo_drive(data_trabalho)
+        df = original.AdministrativeProcessor(pdf).process_pdf()
+        dfs[1] = df.rename(columns={'Sigla':'Tipo'}).copy() if df is not None else pd.DataFrame()
+        resultados['Administrativo'] = 'OK — %d registros (%s)' % (len(dfs[1]), metadados.get('name','arquivo'))
+    except Exception as e:
+        erros['Administrativo'] = '%s: %s' % (type(e).__name__, e)
+    try:
+        indisponiveis, aviso = original.listar_indisponiveis_calendar(data_trabalho)
+        if aviso:
+            erros['Calendário'] = aviso
+        else:
+            resultados['Calendário'] = 'OK — indisponíveis: ' + (', '.join(sorted(indisponiveis)) or 'nenhum')
+    except Exception as e:
+        indisponiveis = set()
+        erros['Calendário'] = '%s: %s' % (type(e).__name__, e)
+    if not erros:
+        dfs = original.distribuir_tarefas_extraidas_em_blocos(*dfs, indisponiveis=indisponiveis)
+    return urls, dfs, resultados, erros
+
+
+def criar_relatorio_csv(dfs):
+    nomes = ['normas_executivo','normas_administrativo','normas_legislativo','proposicoes','requerimentos','pareceres']
+    saida = io.BytesIO()
+    with zipfile_archive.ZipFile(saida, mode='w', compression=zipfile_archive.ZIP_DEFLATED) as zip_out:
+        for nome, df in zip(nomes, dfs):
+            zip_out.writestr(nome + '.csv', df.to_csv(index=False, sep=';').encode('utf-8-sig'))
+    return saida.getvalue()
+
+
+def tabela_resumo(dfs):
+    nomes = ['Normas Executivo','Normas Administrativo','Normas Legislativo','Proposições','Requerimentos','Pareceres']
+    return pd.DataFrame({'Seção': nomes, 'Registros': [len(x) for x in dfs]})
+
+
+try:
+    senha = segredo('SENHA_TESTE_STREAMLIT')
+except Exception as ex:
+    st.error(str(ex))
+    st.stop()
+chave = st.text_input('Senha do aplicativo de testes (não é a senha institucional)', type='password')
+if not chave or not hmac.compare_digest(chave, senha):
+    st.info('Informe a senha de testes para continuar.')
+    st.stop()
+
+st.warning('Este aplicativo usa credencial técnica do WebDrive e uma senha de teste compartilhada. Não identifica individualmente a matrícula de quem executa. Não use na planilha oficial.')
+col1, col2 = st.columns(2)
+with col1:
+    jornal = st.date_input('Data do jornal a extrair', value=date.today(), format='DD/MM/YYYY', max_value=date.today())
+with col2:
+    trabalho = st.date_input('Data para consultar o Diário Administrativo e afastamentos', value=jornal, format='DD/MM/YYYY', max_value=date.today(), help='No código original, esta é a data de trabalho. Pode diferir da data do jornal, especialmente às segundas-feiras.')
+aba = jornal.strftime('%d%m')
+st.caption('Aba prevista: **%s**. Para conferir outra data, selecione-a acima. A data do jornal não é ajustada automaticamente.' % aba)
+
+if st.button('1. Extrair diários reais e preparar ODS', type='primary'):
+    st.session_state.pop('preparado', None)
+    try:
+        with st.spinner('Baixando ODS do WebDrive...'):
+            origem, etag, abas_anteriores = baixar_ods()
+        if aba in abas_anteriores:
+            st.error('A aba %s já existe no arquivo remoto. Nenhuma gravação será feita. Escolha uma data ausente.' % aba)
+            st.stop()
+        with st.spinner('Extraindo diários oficiais e distribuindo as tarefas...'):
+            urls, dfs, status, erros = extrair_data_real(jornal, trabalho)
+        for fonte, mensagem in status.items(): st.success(f'{fonte}: {mensagem}')
+        for fonte, mensagem in erros.items(): st.error(f'{fonte}: {mensagem}')
+        st.dataframe(tabela_resumo(dfs), hide_index=True)
+        if erros:
+            st.error('Extração incompleta: por segurança, a planilha NÃO será criada. Corrija as falhas e tente novamente.')
+            st.stop()
+        payload = criar_payload(jornal, urls, dfs)
+        with st.spinner('Duplicando MODELO e preenchendo o ODS real...'):
+            saida = preencher_com_libreoffice(origem, payload)
+        abas_depois = nomes_abas(saida)
+        if len(abas_depois) != len(abas_anteriores)+1 or abas_depois[1] != aba or set(abas_depois) != set(abas_anteriores) | {aba}:
+            raise RuntimeError('Validação do ODS falhou: abas originais não foram preservadas corretamente.')
+        st.session_state['preparado'] = {'conteudo':saida, 'etag':etag, 'aba':aba,
+            'data':jornal.isoformat(), 'status':status, 'contagens':tabela_resumo(dfs).to_dict('records'),
+            'hash':hashlib.sha256(saida).hexdigest(), 'csv':criar_relatorio_csv(dfs)}
+        st.success('ODS preparado com dados reais: %d abas → %d. Nova aba: %s.' % (len(abas_anteriores),len(abas_depois),aba))
+    except Exception as ex:
+        st.error('%s: %s' % (type(ex).__name__, ex))
+
+preparado = st.session_state.get('preparado')
+if preparado:
+    st.divider()
+    st.subheader('Conferência antes da gravação')
+    st.write('Aba gerada: **%s**; data: **%s**.' % (preparado['aba'],preparado['data']))
+    st.dataframe(pd.DataFrame(preparado['contagens']), hide_index=True)
+    st.download_button('Baixar os registros extraídos (CSV por seção)', preparado['csv'],
+        file_name='extracao_real_'+preparado['aba']+'.zip', mime='application/zip')
+    st.download_button('Baixar ODS preenchido com dados reais', preparado['conteudo'],
+        file_name='Controle_Atividades_TESTE_'+preparado['aba']+'.ods', mime=MIME_ODS)
+    if str(st.secrets.get('ENABLE_REMOTE_WRITE', 'false')).lower() != 'true':
+        st.info('Gravação remota desativada. Para habilitar somente no arquivo de teste, adicione ENABLE_REMOTE_WRITE = "true" nos Secrets.')
+    else:
+        confirma = st.checkbox('Conferi o ODS baixado; a pasta é GDI-GIL/Testes; ninguém está editando a cópia; autorizo atualizar somente essa cópia.')
+        if st.button('2. Gravar a nova aba no WebDrive', disabled=not confirma, type='primary'):
+            try:
+                if preparado['aba'] != jornal.strftime('%d%m') or preparado['data'] != jornal.isoformat():
+                    raise RuntimeError('A data selecionada mudou desde a extração. Prepare novamente.')
+                with st.spinner('Gravando no WebDrive com If-Match e verificando...'):
+                    status = gravar_ods(preparado['conteudo'], preparado['etag'])
+                    remoto, _, abas = baixar_ods()
+                if preparado['aba'] not in abas:
+                    raise RuntimeError('PUT HTTP %d, mas a aba não foi localizada no arquivo remoto. Confira manualmente.' % status)
+                if hashlib.sha256(remoto).hexdigest() != preparado['hash']:
+                    st.warning('A aba existe, mas o conteúdo remoto difere dos bytes enviados; confira se o editor online regravou o arquivo.')
+                st.success('Gravação confirmada: HTTP %d. Aba %s localizada no ODS remoto, total de %d abas.' % (status, preparado['aba'],len(abas)))
+                st.session_state.pop('preparado', None)
+            except Exception as ex:
+                st.error('%s: %s' % (type(ex).__name__, ex))
