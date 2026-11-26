@@ -11,7 +11,8 @@ import re
 import subprocess
 import tempfile
 import zipfile
-from datetime import date
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 from xml.etree import ElementTree as ET
@@ -34,6 +35,9 @@ ARQUIVO_PERMITIDO = 'Controle de Atividades 2026.ods'
 MIME_ODS = 'application/vnd.oasis.opendocument.spreadsheet'
 MAX_ODS = 30 * 1024 * 1024
 MAX_PDF_ADM = 100 * 1024 * 1024
+CALDAV_URL = 'https://webdrive.almg.gov.br/remote.php/dav/'
+CALENDARIO_AFASTAMENTOS = '(GIL) Afastamentos, Férias e Licenças'
+
 PASTA_DIARIO_ADMINISTRATIVO = 'GDI-GIL/Gerencial/diario_administrativo'
 
 
@@ -242,6 +246,54 @@ def corrigir_link_administrativo(ods, aba, url):
     return destino.getvalue()
 
 
+def listar_indisponiveis_webdrive(data_ref):
+    # Consulta somente leitura. Falhas nunca equivalem a calendario vazio.
+    import caldav
+    tz = ZoneInfo('America/Sao_Paulo')
+    inicio = datetime.combine(data_ref, datetime.min.time(), tzinfo=tz)
+    fim = inicio + timedelta(days=1)
+    indisponiveis = set()
+    nao_reconhecidos = []
+    def instante(valor):
+        if isinstance(valor, datetime):
+            return valor.replace(tzinfo=tz) if valor.tzinfo is None else valor.astimezone(tz)
+        return datetime.combine(valor, datetime.min.time(), tzinfo=tz)
+    with caldav.DAVClient(url=CALDAV_URL, username=segredo('WEB_DAV_USUARIO'),
+                          password=segredo('WEB_DAV_SENHA_APP'), timeout=30) as client:
+        calendarios = client.principal().calendars()
+        encontrados = [c for c in calendarios if str(c.name or '').strip() == CALENDARIO_AFASTAMENTOS]
+        if len(encontrados) != 1:
+            raise RuntimeError('Calendário de afastamentos não encontrado ou duplicado. Confira o nome e as permissões.')
+        eventos = encontrados[0].search(start=inicio, end=fim, event=True, expand=True)
+        for evento in eventos:
+            for comp in evento.icalendar_instance.walk('VEVENT'):
+                if str(comp.get('STATUS', '')).upper() == 'CANCELLED':
+                    continue
+                titulo = str(comp.get('SUMMARY', '')).strip()
+                m = original.PADRAO_AFASTAMENTO.match(titulo)
+                if not m:
+                    continue
+                bruto = comp.decoded('DTSTART')
+                ini = instante(bruto)
+                if 'DTEND' in comp:
+                    termino = instante(comp.decoded('DTEND'))
+                elif 'DURATION' in comp:
+                    termino = ini + comp.decoded('DURATION')
+                else:
+                    termino = ini if isinstance(bruto, datetime) else ini + timedelta(days=1)
+                if not (ini < fim and (termino > inicio or (termino == ini and inicio <= ini < fim))):
+                    continue
+                nome = re.sub(r'\s*\(.*?\)\s*$', '', m.group(2)).strip()
+                chave = original.normalizar_nome_chave(nome)
+                mapa = original.MAPA_NOMES_EQUIPE
+                pessoa = mapa.get(chave) or mapa.get(chave.split()[0] if chave.split() else '')
+                if pessoa:
+                    indisponiveis.add(pessoa)
+                else:
+                    nao_reconhecidos.append(nome)
+    return indisponiveis, sorted(set(nao_reconhecidos))
+
+
 def extrair_data_real(data_jornal):
     texto_data = data_jornal.strftime('%d/%m/%Y')
     urls = original.montar_urls(original.preparar_datas(texto_data))
@@ -280,9 +332,20 @@ def extrair_data_real(data_jornal):
         resultados['Administrativo'] = 'OK — %d registros' % len(df_adm)
     except Exception as e:
         erros['Administrativo'] = '%s: %s' % (type(e).__name__, e)
-    # Distribuição das três fontes, sem exclusões por afastamento.
+    # Usa a data da execução das atividades, não a data de publicação.
     if not erros:
-        dfs = original.distribuir_tarefas_extraidas_em_blocos(*dfs, indisponiveis=set())
+        try:
+            data_trabalho = datetime.now(ZoneInfo('America/Sao_Paulo')).date()
+            indisponiveis, desconhecidos = listar_indisponiveis_webdrive(data_trabalho)
+            if desconhecidos:
+                st.warning('Nomes de afastamentos não reconhecidos: ' + ', '.join(desconhecidos))
+            avisos = original.validar_pools_distribuicao(indisponiveis)
+            if avisos:
+                raise RuntimeError(' '.join(avisos))
+            resultados['Calendário'] = 'OK — %s — %s' % (data_trabalho.strftime('%d/%m/%Y'), ', '.join(sorted(indisponiveis)) or 'Nenhum integrante afastado')
+            dfs = original.distribuir_tarefas_extraidas_em_blocos(*dfs, indisponiveis=indisponiveis)
+        except Exception as e:
+            erros['Calendário'] = '%s: %s' % (type(e).__name__, e)
     return urls, dfs, resultados, erros
 
 
@@ -312,8 +375,16 @@ if not chave or not hmac.compare_digest(chave, senha):
 
 st.warning('Este aplicativo usa credencial técnica do WebDrive e uma senha de teste compartilhada. Não identifica individualmente a matrícula de quem executa. Não use na planilha oficial.')
 jornal = st.date_input('Data do jornal a extrair', value=date.today(), format='DD/MM/YYYY', max_value=date.today())
-st.caption('Fontes: Jornal Minas Gerais (Executivo), Diário Administrativo (WebDrive) e Diário do Legislativo. Sem Google Calendar. A distribuição não considera afastamentos.')
+st.caption('Fontes: Jornal Minas Gerais (Executivo), Diário Administrativo (WebDrive) e Diário do Legislativo. A distribuição considera afastamentos do calendário institucional na data de trabalho (hoje, horário de Brasília).')
 aba = jornal.strftime('%d%m')
+if st.button('Consultar afastamentos de hoje'):
+    try:
+        pessoas, desconhecidos = listar_indisponiveis_webdrive(datetime.now(ZoneInfo('America/Sao_Paulo')).date())
+        st.success('Calendário consultado: ' + (', '.join(sorted(pessoas)) or 'Nenhum integrante afastado'))
+        if desconhecidos:
+            st.warning('Nomes não reconhecidos: ' + ', '.join(desconhecidos))
+    except Exception as ex:
+        st.error('Falha na consulta CalDAV: ' + type(ex).__name__ + ': ' + str(ex))
 st.caption('Aba prevista: **%s**. Para conferir outra data, selecione-a acima. A data do jornal não é ajustada automaticamente.' % aba)
 
 if st.button('1. Extrair diários reais e preparar ODS', type='primary'):
