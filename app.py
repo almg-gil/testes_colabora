@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Teste: Executivo e Legislativo REAIS -> DataFrames -> ODS real -> WebDrive.
+"""Teste: Executivo, Administrativo e Legislativo REAIS -> DataFrames -> ODS real -> WebDrive.
 Não utiliza dados fictícios. Não muda arquivo remoto sem confirmação.
 """
 import hashlib
@@ -22,9 +22,10 @@ import streamlit as st
 
 import extracao_original as original
 from corrigir_links_ods import corrigir_links_aba
+from lxml import etree
 
 st.set_page_config(page_title="Extração real para ODS - ALMG", layout="wide")
-st.title("Extração do Executivo e Legislativo → ODS no WebDrive")
+st.title("Extração do Executivo, Administrativo e Legislativo → ODS no WebDrive")
 st.caption("Teste com dados reais, restrito à cópia GDI-GIL/Testes/Controle de Atividades 2026.ods")
 
 HOST = 'webdrive.almg.gov.br'
@@ -32,6 +33,8 @@ PASTA_PERMITIDA = 'GDI-GIL/Testes'
 ARQUIVO_PERMITIDO = 'Controle de Atividades 2026.ods'
 MIME_ODS = 'application/vnd.oasis.opendocument.spreadsheet'
 MAX_ODS = 30 * 1024 * 1024
+MAX_PDF_ADM = 100 * 1024 * 1024
+PASTA_DIARIO_ADMINISTRATIVO = 'GDI-GIL/Gerencial/diario_administrativo'
 
 
 def segredo(nome):
@@ -92,6 +95,30 @@ def baixar_ods():
     return conteudo, etag, abas
 
 
+def baixar_pdf_administrativo_webdav(data_jornal):
+    # Reutiliza a URL já validada e a mesma credencial da planilha.
+    prefixo = endereco_ods().rsplit('/', 3)[0]
+    nome = original.nome_arquivo_diario_administrativo(data_jornal)
+    relativo = '/'.join(quote(x, safe='') for x in (PASTA_DIARIO_ADMINISTRATIVO + '/' + nome).split('/'))
+    url = prefixo + '/' + relativo
+    with sessao() as s:
+        with s.get(url, stream=True, timeout=(15, 120), allow_redirects=False) as r:
+            if r.status_code == 404:
+                raise FileNotFoundError('Diário Administrativo não encontrado: ' + nome)
+            if r.status_code != 200:
+                raise RuntimeError('Leitura do Administrativo: HTTP ' + str(r.status_code))
+            buf = io.BytesIO()
+            for parte in r.iter_content(262144):
+                if parte:
+                    if buf.tell() + len(parte) > MAX_PDF_ADM:
+                        raise RuntimeError('PDF administrativo acima de 100 MB.')
+                    buf.write(parte)
+    pdf = buf.getvalue()
+    if not pdf.startswith(b'%PDF-'):
+        raise ValueError('O arquivo administrativo não é um PDF válido.')
+    return pdf
+
+
 def nomes_abas(conteudo):
     if not zipfile.is_zipfile(io.BytesIO(conteudo)):
         raise RuntimeError('O servidor não retornou um arquivo ODS válido.')
@@ -133,8 +160,7 @@ def linhas_reais(data_str, urls, dfs):
     a, b, c, d, e, f = dfs
     return {
         'executivo': converter_linhas(original.montar_linhas_normas(data_str, a, urls['executivo_html'])),
-        # Secao administrativa sem extracao neste teste; manter o MODELO sem registros.
-        'administrativo': converter_linhas(original.montar_linhas_normas(data_str, pd.DataFrame(), '', False)),
+        'administrativo': converter_linhas(original.montar_linhas_normas(data_str, b, urls['administrativo'], True)),
         'legislativo': converter_linhas(original.montar_linhas_normas(data_str, c, urls['legislativo'], True)),
         'proposicoes': converter_linhas(original.montar_linhas_proposicoes(data_str, d, urls['legislativo'], True)),
         'requerimentos': converter_linhas(original.montar_linhas_requerimentos(data_str, e, urls['legislativo'], True)),
@@ -145,13 +171,13 @@ def linhas_reais(data_str, urls, dfs):
 
 def criar_payload(data_jornal, urls, dfs):
     a,b,c,d,e,f = dfs
-    qtd_alt = [original.somar_quantidade_vides(x) for x in (a,c)]
+    qtd_alt = [original.somar_quantidade_vides(x) for x in (a,b,c)]
     return {
         'modelo': 'MODELO',
         'aba': data_jornal.strftime('%d%m'),
         'secoes': linhas_reais(data_jornal.strftime('%d/%m/%Y'), urls, dfs),
         'totais': {
-            'normas': sum(original.contar_normas_principais(x) for x in (a,c)),
+            'normas': sum(original.contar_normas_principais(x) for x in (a,b,c)),
             'alteracoes': sum(x[0] for x in qtd_alt),
             'vides': sum(x[1] for x in qtd_alt),
             'proposicoes': len(d), 'requerimentos': len(e),
@@ -172,6 +198,48 @@ def preencher_com_libreoffice(ods_origem, payload):
         if r.returncode or not destino.exists():
             raise RuntimeError('Falha na edição do ODS. ' + (r.stdout+' '+r.stderr)[-1600:])
         return destino.read_bytes()
+
+
+def corrigir_link_administrativo(ods, aba, url):
+    # A correção anterior remove o estilo antigo do Administrativo.
+    # Reaplica um link explícito, como já é feito no Executivo.
+    T = '{urn:oasis:names:tc:opendocument:xmlns:table:1.0}'
+    O = '{urn:oasis:names:tc:opendocument:xmlns:office:1.0}'
+    X = '{http://www.w3.org/1999/xlink}'
+    TEXT = '{urn:oasis:names:tc:opendocument:xmlns:text:1.0}'
+    destino = io.BytesIO()
+    with zipfile.ZipFile(io.BytesIO(ods)) as z:
+        raiz = etree.fromstring(z.read('content.xml'))
+        folhas = [f for f in raiz.iter(T+'table') if f.get(T+'name') == aba]
+        if len(folhas) != 1:
+            raise ValueError('Aba não encontrada para link administrativo.')
+        linhas = folhas[0].findall(T+'table-row')
+        alvos = []
+        for i, linha in enumerate(linhas[:-1]):
+            cel = linha.find(T+'table-cell')
+            if cel is not None and ''.join(cel.itertext()).strip().upper() == 'DIÁRIO ADMINISTRATIVO':
+                alvos.append(linhas[i+1].find(T+'table-cell'))
+        if len(alvos) != 1 or alvos[0] is None:
+            raise ValueError('Célula de data do Administrativo não encontrada.')
+        alvo = alvos[0]
+        rotulo = ''.join(alvo.itertext()).strip()
+        if not rotulo:
+            raise ValueError('Data do Administrativo vazia.')
+        alvo.attrib.pop(T+'formula', None)
+        for atributo in ('value', 'date-value', 'string-value', 'time-value', 'boolean-value'):
+            alvo.attrib.pop(O+atributo, None)
+        alvo.set(O+'value-type', 'string')
+        for filho in list(alvo):
+            alvo.remove(filho)
+        ancora = etree.SubElement(etree.SubElement(alvo, TEXT+'p'), TEXT+'a')
+        ancora.set(X+'type', 'simple')
+        ancora.set(X+'href', url)
+        ancora.text = rotulo
+        xml = etree.tostring(raiz, encoding='UTF-8', xml_declaration=True)
+        with zipfile.ZipFile(destino, 'w') as out:
+            for info in z.infolist():
+                out.writestr(info, xml if info.filename == 'content.xml' else z.read(info.filename))
+    return destino.getvalue()
 
 
 def extrair_data_real(data_jornal):
@@ -203,15 +271,23 @@ def extrair_data_real(data_jornal):
         resultados['Legislativo'] = 'OK — %d normas, %d proposições, %d requerimentos, %d pareceres' % tuple(len(dfs[i]) for i in (2,3,4,5))
     except Exception as e:
         erros['Legislativo'] = '%s: %s' % (type(e).__name__, e)
-    # O Diario Administrativo e o Google Calendar nao fazem parte deste teste.
-    # Distribuicao original, usando as duas fontes reais e sem exclusoes por afastamento.
+    try:
+        pdf_adm = baixar_pdf_administrativo_webdav(data_jornal)
+        df_adm = original.AdministrativeProcessor(pdf_adm).process_pdf()
+        if df_adm is None:
+            raise RuntimeError('Falha no processamento do PDF administrativo.')
+        dfs[1] = df_adm.rename(columns={'Sigla': 'Tipo'}).copy()
+        resultados['Administrativo'] = 'OK — %d registros' % len(df_adm)
+    except Exception as e:
+        erros['Administrativo'] = '%s: %s' % (type(e).__name__, e)
+    # Distribuição das três fontes, sem exclusões por afastamento.
     if not erros:
         dfs = original.distribuir_tarefas_extraidas_em_blocos(*dfs, indisponiveis=set())
     return urls, dfs, resultados, erros
 
 
 def criar_relatorio_csv(dfs):
-    nomes = ['normas_executivo','normas_administrativo_vazio','normas_legislativo','proposicoes','requerimentos','pareceres']
+    nomes = ['normas_executivo','normas_administrativo','normas_legislativo','proposicoes','requerimentos','pareceres']
     saida = io.BytesIO()
     with zipfile_archive.ZipFile(saida, mode='w', compression=zipfile_archive.ZIP_DEFLATED) as zip_out:
         for nome, df in zip(nomes, dfs):
@@ -220,7 +296,7 @@ def criar_relatorio_csv(dfs):
 
 
 def tabela_resumo(dfs):
-    nomes = ['Normas Executivo','Normas Administrativo (não consultado)','Normas Legislativo','Proposições','Requerimentos','Pareceres']
+    nomes = ['Normas Executivo','Normas Administrativo','Normas Legislativo','Proposições','Requerimentos','Pareceres']
     return pd.DataFrame({'Seção': nomes, 'Registros': [len(x) for x in dfs]})
 
 
@@ -236,7 +312,7 @@ if not chave or not hmac.compare_digest(chave, senha):
 
 st.warning('Este aplicativo usa credencial técnica do WebDrive e uma senha de teste compartilhada. Não identifica individualmente a matrícula de quem executa. Não use na planilha oficial.')
 jornal = st.date_input('Data do jornal a extrair', value=date.today(), format='DD/MM/YYYY', max_value=date.today())
-st.caption('Fontes: Jornal Minas Gerais (Executivo) e Diário do Legislativo. Sem Diário Administrativo e sem Google Calendar. A distribuição não considera afastamentos.')
+st.caption('Fontes: Jornal Minas Gerais (Executivo), Diário Administrativo (WebDrive) e Diário do Legislativo. Sem Google Calendar. A distribuição não considera afastamentos.')
 aba = jornal.strftime('%d%m')
 st.caption('Aba prevista: **%s**. Para conferir outra data, selecione-a acima. A data do jornal não é ajustada automaticamente.' % aba)
 
@@ -260,6 +336,7 @@ if st.button('1. Extrair diários reais e preparar ODS', type='primary'):
         with st.spinner('Duplicando MODELO e preenchendo o ODS real...'):
             saida = preencher_com_libreoffice(origem, payload)
             saida = corrigir_links_aba(saida, aba, urls)
+            saida = corrigir_link_administrativo(saida, aba, urls['administrativo'])
         abas_depois = nomes_abas(saida)
         if len(abas_depois) != len(abas_anteriores)+1 or abas_depois[1] != aba or set(abas_depois) != set(abas_anteriores) | {aba}:
             raise RuntimeError('Validação do ODS falhou: abas originais não foram preservadas corretamente.')
