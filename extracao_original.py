@@ -2682,6 +2682,330 @@ class LegislativeProcessor:
 # =========================
 # CLASS AdministrativeProcessor
 # =========================
+class AdministrativeProcessor:
+    def __init__(self, pdf_bytes: bytes):
+        self.pdf_bytes = pdf_bytes
+
+        self.meses = {
+            "janeiro": "01",
+            "fevereiro": "02",
+            "março": "03",
+            "marco": "03",
+            "abril": "04",
+            "maio": "05",
+            "junho": "06",
+            "julho": "07",
+            "agosto": "08",
+            "setembro": "09",
+            "outubro": "10",
+            "novembro": "11",
+            "dezembro": "12"
+        }
+
+        self.norma_publicada_regex = re.compile(
+            r'^(DELIBERAÇÃO DA MESA|'
+            r'PORTARIA\s+(?:DGE|PSEC\s*/\s*DGE|PRES\s*/\s*DGE|PRES\s*/\s*PSEC|PRES\s*/\s*PSEC\s*/\s*DGE)|'
+            r'ORDEM DE SERVIÇO\s+(?:DGE|PSEC\s*/\s*DGE|PRES\s*/\s*PSEC|PRES\s*/\s*PSEC\s*/\s*DGE))'
+            r'\s+N[º°]\s+([\d\.]+(?:-[A-Z])?)\s*/\s*(\d{4})\s*$',
+            re.IGNORECASE | re.MULTILINE
+        )
+
+        self.revogacoes_caput_regex = re.compile(
+            r'Ficam\s+revogados\s+os\s+seguintes\s+atos'
+            r'(?:\s+e\s+dispositivos)?\s+normativos,'
+            r'\s+sem\s+preju[ií]zo\s+dos\s+efeitos\s+por\s+eles\s+produzidos\s*:',
+            re.IGNORECASE
+        )
+
+        self.revogacao_simples_regex = re.compile(r'\bFic(?:a|am)\s+revogad(?:a|o|as|os)\b', re.IGNORECASE)
+        self.sem_efeito_regex = re.compile(r'\bFic(?:a|am)\s+sem\s+efeito\b|\bTorn(?:a|am)\s+sem\s+efeito\b', re.IGNORECASE)
+        self.prorrogacao_regex = re.compile(r'\bFic(?:a|am)\s+prorrogad(?:a|o|as|os)\b', re.IGNORECASE)
+        self.substituicao_regex = re.compile(
+            r'\bFic(?:a|am)\s+substitu[ií]d(?:a|o|as|os)\b',
+            re.IGNORECASE
+        )
+        self.redacao_regex = re.compile(
+            r'\bpassa\s+a\s+vigorar\b|\bpassam\s+a\s+vigorar\b|\bpassa\s+a\s+vigorar\s+com\s+a\s+seguinte\s+reda[cç][aã]o\b',
+            re.IGNORECASE
+        )
+
+        dash = r'[–—-]'
+
+        self.fim_lista_revogacoes_regex = re.compile(
+            rf'\bArt\.\s*\d+º?\s*{dash}\s*|\bArtigo\s+\d+º?\s*{dash}\s*',
+            re.IGNORECASE
+        )
+
+        sigla_adm = (
+            rf'(?:DGE|PSEC\s*/\s*DGE|PRES\s*/\s*DGE|'
+            rf'PRES\s*/\s*PSEC|PRES\s*/\s*PSEC\s*/\s*DGE)'
+        )
+
+        qualificador_travessao = rf'(?:\s*{dash}\s*{sigla_adm}\s*{dash})?'
+
+        self.norma_alterada_regex = re.compile(
+            rf'\b('
+                rf'DELIBERAÇÃO\s+DA\s+MESA'
+                rf'|'
+                rf'PORTARIA'
+                rf'(?:'
+                    rf'\s+DA\s+DIRETORIA-GERAL'
+                    rf'|\s+DA\s+PRESID[ÊE]NCIA\s+E\s+DA\s+DIRETORIA-GERAL'
+                    rf'|\s+DGE'
+                    rf'|\s+PSEC\s*/\s*DGE'
+                    rf'|\s+PRES\s*/\s*DGE'
+                    rf'|\s+PRES\s*/\s*PSEC'
+                    rf'|\s+PRES\s*/\s*PSEC\s*/\s*DGE'
+                rf')?'
+                rf'{qualificador_travessao}'
+                rf'|'
+                rf'ORDEM\s+DE\s+SERVI[ÇC]O'
+                rf'(?:'
+                    rf'\s+DA\s+PRESID[ÊE]NCIA'
+                    rf'(?:,\s*DA\s+1[ªº]\s*{dash}\s*SECRETARIA)?'
+                    rf'(?:\s+E\s+DA\s+DIRETORIA-GERAL)?'
+                    rf'|'
+                    rf'\s+DA\s+1[ªº]\s*{dash}\s*SECRETARIA'
+                    rf'\s+E\s+DA\s+DIRETORIA-GERAL'
+                    rf'|\s+DGE'
+                    rf'|\s+PSEC\s*/\s*DGE'
+                    rf'|\s+PRES\s*/\s*PSEC'
+                    rf'|\s+PRES\s*/\s*PSEC\s*/\s*DGE'
+                rf')?'
+                rf'{qualificador_travessao}'
+            rf')'
+            rf'\s*N[º°]\s*([\d\.]+(?:-[A-Z])?)'
+            rf'(?:\s*/\s*(\d{{4}}))?'
+            rf'(?:\s*,\s*de\s*[^;\.]*?(\d{{4}}))?',
+            re.IGNORECASE
+        )
+
+        self.fecho_palacio_regex = re.compile(
+            r'Pal[aá]cio\s+da\s+Inconfid[eê]ncia\s*,\s*'
+            r'(\d{1,2})\s+de\s+([A-Za-zçÇãÃáÁéÉíÍóÓôÔúÚ]+)\s+de\s+(\d{4})',
+            re.IGNORECASE
+        )
+        self.fecho_sala_mesa_regex = re.compile(
+            r'Sala\s+de\s+Reuni[õo]es\s+da\s+Mesa\s+da\s+Assembleia'
+            r'(?:\s+Legislativa)?\s*,\s*'
+            r'(\d{1,2})\s+de\s+([A-Za-zçÇãÃáÁéÉíÍóÓôÔúÚ]+)\s+de\s+(\d{4})',
+            re.IGNORECASE
+        )
+
+        self.regex_dcs = re.compile(r'DECIS[ÃA]O DA 1ª-SECRETARIA', re.IGNORECASE)
+
+    def _formatar_data_fecho(self, bloco: str) -> str:
+        bloco = bloco or ""
+
+        m = self.fecho_palacio_regex.search(bloco)
+        if not m:
+            m = self.fecho_sala_mesa_regex.search(bloco)
+        if not m:
+            return ""
+
+        dia = m.group(1).zfill(2)
+        mes_nome = (m.group(2) or "").strip().lower()
+        ano = (m.group(3) or "").strip()
+        mes = self.meses.get(mes_nome, "")
+        if not mes:
+            return ""
+        return f"{dia}/{mes}/{ano}"
+
+    def _normalizar_sigla(self, tipo_txt_upper: str) -> str:
+            t = (tipo_txt_upper or "").upper()
+            t = re.sub(r'\s+', ' ', t)
+            t = re.sub(r'\s*/\s*', '/', t)
+
+            if "DELIBERAÇÃO DA MESA" in t:
+                return "DLB"
+            if "PORTARIA" in t:
+                return "PRT"
+            if "ORDEM DE SERVI" in t:
+                return "OSV"
+
+            return t.strip()
+
+    def _sigla_norma_publicada(self, tipo_raw: str) -> str:
+        t = (tipo_raw or "").upper().strip()
+        t = re.sub(r'\s+', ' ', t)
+        t = re.sub(r'\s*/\s*', '/', t)
+        return {
+            "DELIBERAÇÃO DA MESA": "DLB",
+            "PORTARIA DGE": "PRT",
+            "PORTARIA PSEC/DGE": "PRT",
+            "PORTARIA PRES/DGE": "PRT",
+            "PORTARIA PRES/PSEC": "PRT",
+            "ORDEM DE SERVIÇO PRES/PSEC": "OSV",
+        }.get(t, "")
+
+    def process_pdf(self):
+        try:
+            reader = pypdf.PdfReader(io.BytesIO(self.pdf_bytes))
+        except Exception as e:
+            st.error(f"Erro ao abrir o arquivo PDF: {e}")
+            return None
+
+        page_texts = []
+        for p in reader.pages:
+            page_texts.append(re.sub(r"\n+", "\n", re.sub(r"[ \t]+", " ", p.extract_text() or "")))
+
+        if not any(t.strip() for t in page_texts):
+            raise ValueError("PDF administrativo sem texto extraível.")
+
+        offsets = []
+        full_text_parts = []
+        cursor = 0
+        for idx, pt in enumerate(page_texts, start=1):
+            full_text_parts.append(pt + "\n")
+            cursor_end = cursor + len(pt) + 1
+            offsets.append((cursor, cursor_end, idx))
+            cursor = cursor_end
+
+        full_text = "".join(full_text_parts)
+
+        def _pagina_from_pos(pos: int):
+            for start, end, pnum in offsets:
+                if start <= pos < end:
+                    return pnum
+            return ""
+
+        def _segmento_ate_proximo_artigo(bloco: str, pos: int) -> str:
+            trecho = bloco[pos:]
+            m_art = self.fim_lista_revogacoes_regex.search(trecho)
+
+            if m_art:
+                return trecho[:m_art.start()]
+
+            return trecho
+
+        normas = []
+        for m in self.norma_publicada_regex.finditer(full_text):
+            pos = m.start()
+            pagina = _pagina_from_pos(pos)
+
+            tipo_raw = m.group(1)
+            numero = (m.group(2) or "").replace(".", "").replace(" ", "")
+            ano = (m.group(3) or "").strip()
+
+            sigla = self._sigla_norma_publicada(tipo_raw)
+            if sigla:
+                normas.append({
+                    "pos": pos,
+                    "end": m.end(),
+                    "pagina": pagina,
+                    "coluna": 1,
+                    "sigla": sigla,
+                    "numero": numero,
+                    "ano": ano
+                })
+
+        resultados = []
+
+        for i, n in enumerate(normas):
+            start = n["end"]
+            end = normas[i + 1]["pos"] if i + 1 < len(normas) else len(full_text)
+            bloco = full_text[start:end]
+
+            linha = {
+                "Página": n["pagina"],
+                "Coluna": n["coluna"],
+                "Sanção": self._formatar_data_fecho(bloco),
+                "Sigla": n["sigla"],
+                "Número": n["numero"],
+                "Ano": n["ano"],
+                "Alterações": ""
+            }
+            resultados.append(linha)
+
+            seen_alteracoes = set()
+
+            def _add_alt(chave: str):
+                nonlocal resultados
+
+                chave = re.sub(r"\s+", " ", str(chave or "").strip().upper())
+
+                if not chave:
+                    return
+
+                if chave in seen_alteracoes:
+                    return
+    
+                seen_alteracoes.add(chave)
+
+                if linha["Alterações"] == "":
+                    linha["Alterações"] = chave
+                else:
+                    resultados.append({
+                        "Página": "",
+                        "Coluna": "",
+                        "Sanção": "",
+                        "Sigla": "",
+                        "Número": "",
+                        "Ano": "",
+                        "Alterações": chave
+                    })
+
+            def _extrair_alteracoes(seg: str):
+                for alt in self.norma_alterada_regex.finditer(seg or ""):
+                    tipo_alt_raw = (alt.group(1) or "").upper().strip()
+                    num_alt = (alt.group(2) or "").replace(".", "").replace(" ", "")
+                    ano_alt = alt.group(3) or alt.group(4) or ""
+                    sigla_alt = self._normalizar_sigla(tipo_alt_raw)
+
+                    if sigla_alt == linha["Sigla"] and num_alt == linha["Número"]:
+                        if (not ano_alt) or (ano_alt == linha["Ano"]):
+                            continue
+
+                    chave = f"{sigla_alt} {num_alt}" + (f" {ano_alt}" if ano_alt else "")
+                    _add_alt(chave)
+
+            cap = self.revogacoes_caput_regex.search(bloco)
+            if cap:
+                after = bloco[cap.end():]
+                fim = None
+                m_art = self.fim_lista_revogacoes_regex.search(after)
+                if m_art:
+                    fim = m_art.start()
+                segmento = after[:fim] if fim is not None else after
+                _extrair_alteracoes(segmento)
+
+            gats_genericos = [
+                self.substituicao_regex,
+                self.sem_efeito_regex,
+                self.prorrogacao_regex,
+            ]
+
+            # Se já houve caput específico de revogação, não processa
+            # "Ficam revogados" de novo pelo gatilho genérico.
+            if not cap:
+                gats_genericos.append(self.revogacao_simples_regex)
+
+            for gat in gats_genericos:
+                for gm in gat.finditer(bloco):
+                    janela = _segmento_ate_proximo_artigo(bloco, gm.start())
+                    _extrair_alteracoes(janela)
+
+            for gm in self.redacao_regex.finditer(bloco):
+                start_j = max(0, gm.start() - 600)
+                end_j = min(len(bloco), gm.end() + 1200)
+                janela = bloco[start_j:end_j]
+                _extrair_alteracoes(janela)
+
+        if self.regex_dcs.search(full_text):
+            resultados.append({
+                "Página": "",
+                "Coluna": 1,
+                "Sanção": "",
+                "Sigla": "DCS",
+                "Número": "",
+                "Ano": "",
+                "Alterações": ""
+            })
+
+        return pd.DataFrame(
+            resultados,
+            columns=["Página", "Coluna", "Sanção", "Sigla", "Número", "Ano", "Alterações"]
+        )
 
 
 # =========================
@@ -2972,5 +3296,4 @@ class ExecutiveProcessor:
                                 "Observação": ""
                             })
         return pd.DataFrame(dados) if dados else pd.DataFrame()
-
 
